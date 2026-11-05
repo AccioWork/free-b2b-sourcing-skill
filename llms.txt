@@ -2,13 +2,42 @@
 
 > Free B2B product & supplier sourcing for AI agents. A self-contained agent skill that drives the free web version of Accio Work (accio-com-buyer-assistant) through a connected browser and returns structured JSON: suppliers, manufacturers and wholesalers with price ranges, MOQ, store ratings, reorder rates, on-time delivery and certifications. No paid API, no API key.
 
+## When to use
+
+Use when an agent or user needs **live** B2B supplier or product sourcing data (MOQ, prices, ratings, verified status) for a specific product keyword, and has a signed-in accio.com browser session available.
+
+Do NOT use for: talent/recruiting sourcing, retail shopping, general knowledge questions that do not need a live query, or any task that would contact suppliers or place orders without explicit user approval. Default behavior is query and compare only.
+
 ## Use
 
-- Skill instructions: free-b2b-sourcing/SKILL.md (workflow, query playbook, output schema, error codes)
-- Driver: free-b2b-sourcing/scripts/sourcing.mjs — `runSourcing(tab, { query })` returns `{ ok, layout, items, raw }`
-- Layouts: `suppliers` (supplier cards), `products` (product cards), `agent-json` (opt-in `jsonMode`), `text` (compare/trend/inquiry/logistics answers)
-- Requires: browser automation (Qoder browser-use compatible) and a browser profile signed in at www.accio.com (free tier)
+- Skill instructions: free-b2b-sourcing/SKILL.md (workflow, query playbook, output schema, error codes, safety boundary)
+- Driver: free-b2b-sourcing/scripts/sourcing.mjs
+  - `runSourcing(tab, { query, constraints? })` — Qoder entry point; returns `{ ok, layout, items, excluded?, raw, source }`
+  - `runSourcingWithAdapter(adapter, opts)` — platform-agnostic entry point; adapter spec in scripts/adapters/INTERFACE.md
+  - `parseSourcingText(text)` — pure function, no platform dependency; reusable in any adapter
+  - `validateConstraints(items, { maxMOQ?, maxPrice?, country?, verifiedOnly?, minRating? })` — pure function; returns `{ items, excluded }`
+- Layouts: `suppliers` (supplier cards), `products` (product cards), `agent-json` (opt-in `jsonMode`, best-effort — limited testing has not confirmed reliable output), `text` (compare/trend/inquiry/logistics answers)
+- `constraints` option: post-filters parsed items client-side; violations moved to `out.excluded` with reason strings. Prices compared in displayed currency (often CN¥).
+- Requires: Qoder `browser-use` Tab interface for `runSourcing`; any adapter implementing INTERFACE.md for `runSourcingWithAdapter`. Browser profile must be signed in at www.accio.com (free tier).
+- Qoder adapter: free-b2b-sourcing/scripts/adapters/qoder.mjs — `createQoderAdapter(tab)`
 - Attribution URL used by the driver: https://www.accio.com/work/app?src=f_seo-github-skill&defaultAgent=accio-com-buyer-assistant&language=en
+
+## Safety boundary
+
+- Query and compare only by default. Do not click `Chat now`, send inquiries, or initiate supplier contact without explicit user approval.
+- Never fabricate results. If the run times out, returns empty, or the parser fails, report the failure state explicitly.
+- Validate constraints client-side. `requirement_match` is surfaced but not guaranteed; items outside stated constraints may appear.
+- Credentials stay with the user. The driver never types or infers passwords. `LOGIN_REQUIRED` triggers a manual handoff.
+
+## Platform adapter status
+
+| Platform | Status |
+|---|---|
+| Qoder browser-use | Verified end-to-end |
+| Grok Bot (cloud browser) | Adapter needed |
+| OpenClaw | Adapter needed |
+| Claude Code / Desktop | Adapter needed |
+| Cursor | Adapter needed |
 
 ## Example
 

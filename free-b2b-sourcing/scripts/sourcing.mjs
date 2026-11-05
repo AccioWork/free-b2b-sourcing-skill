@@ -22,8 +22,8 @@ const JSON_SUFFIX =
   '\n\nAfter the result cards, also output ONE fenced ```json code block: an array with one object per card shown, using exactly these field names where present: type, name, title, source, verified, years, region, country, metrics, main_categories, products, prices, min_order, supplier, supplier_rating, requirement_match. No prose inside the block.';
 
 /** Read the last fenced JSON array the agent rendered, if any. */
-async function extractAgentJson(tab) {
-  const blocks = tab.playwright.locator('pre, code');
+async function extractAgentJson(adapter) {
+  const blocks = adapter.locator('pre, code');
   const n = await blocks.count().catch(() => 0);
   for (let i = n - 1; i >= 0; i--) {
     const t = String((await blocks.nth(i).innerText().catch(() => '')) || '').trim();
@@ -229,8 +229,8 @@ export function parseSourcingText(text) {
   return { layout: 'text', query_echo: queryEcho, items: [], text: lines.join('\n') };
 }
 
-function composerOf(tab) {
-  return tab.playwright.locator('[contenteditable="true"]').first();
+function composerOf(adapter) {
+  return adapter.locator('[contenteditable="true"]').first();
 }
 
 /**
@@ -238,8 +238,8 @@ function composerOf(tab) {
  * state and CUA typing depends on OS window focus, but a dispatched paste
  * event with a DataTransfer is consumed reliably.
  */
-async function pasteType(tab, text) {
-  const ed = composerOf(tab);
+async function pasteType(adapter, text) {
+  const ed = composerOf(adapter);
   await ed.click({ timeout: 5000 }).catch(() => {});
   await ed.evaluate((el, t) => {
     const dt = new DataTransfer();
@@ -247,8 +247,8 @@ async function pasteType(tab, text) {
     el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
   }, text);
 }
-async function transcriptFallback(tab, query) {
-  const state = await tab.ax.get('state', { disableDiffing: true }).catch(() => '');
+async function transcriptFallback(adapter, query) {
+  const state = await adapter.axState().catch(() => '');
   const s = typeof state === 'string' ? state : JSON.stringify(state);
   const lines = s
     .split('\n')
@@ -259,10 +259,10 @@ async function transcriptFallback(tab, query) {
   return tail.join('\n');
 }
 
-async function detectLogin(tab) {
+async function detectLogin(adapter) {
   const probes = ['Continue with Google', 'Sign in', 'Log in', 'Sign up'];
   for (const p of probes) {
-    const n = await tab.playwright
+    const n = await adapter
       .getByText(p, { exact: false })
       .count()
       .catch(() => 0);
@@ -271,38 +271,124 @@ async function detectLogin(tab) {
   return null;
 }
 
+/** Extract the leading numeric value from a displayed price string. */
+function parsePrice(str) {
+  if (!str) return null;
+  const m = String(str).match(/[\d][\d.,]*/);
+  return m ? parseFloat(m[0].replace(/,/g, '')) : null;
+}
+
+/** Extract the numeric quantity from an MOQ string like "100 pieces". */
+function parseMOQ(str) {
+  if (!str) return null;
+  const m = String(str).match(/(\d[\d.,]*)/);
+  return m ? parseInt(m[1].replace(/,/g, ''), 10) : null;
+}
+
 /**
- * Run one sourcing query end-to-end on the given tab.
- * @param {object} tab  browser-use tab (already created via browser.tabs.new())
- * @param {object} opts { query, waitMs=180000, pollMs=4000, settleRounds=2 }
- * @returns {object} { ok, layout, items, raw, ... } or { ok:false, error }
+ * Post-filter parsed items against user-supplied constraints.
+ * Returns { items: [...passed], excluded: [{item, violations}] }.
+ *
+ * constraints: { maxMOQ?, maxPrice?, country?, verifiedOnly?, minRating? }
+ * Prices are compared in the displayed currency (often CN¥) — convert before
+ * setting maxPrice if you need USD.
  */
-export async function runSourcing(tab, opts = {}) {
-  const { query, waitMs = 180000, pollMs = 3000, settleRounds = 3, jsonMode = false } = opts;
+export function validateConstraints(items, constraints) {
+  if (!constraints || !Array.isArray(items)) return { items: items || [], excluded: [] };
+  const passed = [];
+  const excluded = [];
+  for (const item of items) {
+    const violations = [];
+    if (constraints.maxMOQ != null) {
+      const moq = item.type === 'product'
+        ? parseMOQ(item.min_order)
+        : (item.products?.[0] ? parseMOQ(item.products[0].min_order) : null);
+      if (moq !== null && moq > constraints.maxMOQ) violations.push(`MOQ ${moq} > ${constraints.maxMOQ}`);
+    }
+    if (constraints.maxPrice != null) {
+      const prices = item.type === 'product'
+        ? (item.prices || []).map(parsePrice).filter(p => p !== null)
+        : (item.products || []).map(p => parsePrice(p.price)).filter(p => p !== null);
+      const min = prices.length ? Math.min(...prices) : null;
+      if (min !== null && min > constraints.maxPrice) violations.push(`price ${min} > ${constraints.maxPrice}`);
+    }
+    if (constraints.verifiedOnly) {
+      const v = item.type === 'supplier' ? item.verified : item.supplier_verified;
+      if (!v) violations.push('not verified');
+    }
+    if (constraints.country) {
+      const c = item.type === 'supplier' ? item.country : item.supplier_country;
+      if (c && c !== constraints.country) violations.push(`country ${c} ≠ ${constraints.country}`);
+    }
+    if (constraints.minRating != null) {
+      const rs = item.type === 'supplier' ? item.metrics?.['Store rating'] : item.supplier_rating?.value;
+      const rm = rs?.match(/(\d+\.?\d*)/);
+      const r = rm ? parseFloat(rm[1]) : null;
+      if (r !== null && r < constraints.minRating) violations.push(`rating ${r} < ${constraints.minRating}`);
+    }
+    if (violations.length) excluded.push({ item, violations });
+    else passed.push(item);
+  }
+  return { items: passed, excluded };
+}
+
+/**
+ * Heuristic gate for the AX fallback: does this text look like actual sourcing
+ * results rather than navigation chrome, sidebar, or an empty/loading state?
+ * Requires at least 2 distinct sourcing-specific signals to pass.
+ */
+function looksLikeSourcingResult(text) {
+  if (!text || text.length < 50) return false;
+  const patterns = [
+    /supplier/i, /manufacturer/i, /MOQ|min\.?\s*order/i,
+    /CN¥|US\s?\$|€|£|\$/i, /verified/i, /\byrs?\b/i,
+    /store rating/i, /alibaba/i, /1688/i, /pieces?\b/i,
+    /wholesale/i, /reorder rate/i, /on-time delivery/i,
+  ];
+  return patterns.filter(p => p.test(text)).length >= 2;
+}
+
+/**
+ * Core implementation. Takes a browser adapter (see adapters/INTERFACE.md).
+ * @param {object} adapter  Browser adapter with goto/url/locator/frameLocator/etc.
+ * @param {object} opts { query, waitMs=180000, pollMs=3000, settleRounds=3, jsonMode=false, constraints=null }
+ * @returns {object} { ok, layout, items, raw, excluded?, ... } or { ok:false, error }
+ */
+async function _runSourcingCore(adapter, opts = {}) {
+  const { query, waitMs = 180000, pollMs = 3000, settleRounds = 3, jsonMode = false, constraints = null } = opts;
   if (!query) return { ok: false, error: 'MISSING_QUERY' };
   const sentQuery = jsonMode ? query + JSON_SUFFIX : query;
 
-  await tab.goto(APP_URL);
+  // Apply client-side constraint filtering to any successful result.
+  const applyConstraints = (result) => {
+    if (constraints && result.items?.length) {
+      const { items: filtered, excluded } = validateConstraints(result.items, constraints);
+      return { ...result, items: filtered, excluded };
+    }
+    return result;
+  };
+
+  await adapter.goto(APP_URL);
   // The app route can bounce to the /work marketing page on a cold profile;
   // retry navigation until the composer (or a login dialog) appears.
   let navTries = 0;
   for (;;) {
     try {
-      await composerOf(tab).waitFor({ state: 'visible', timeout: 20000 });
+      await composerOf(adapter).waitFor({ state: 'visible', timeout: 20000 });
       break;
     } catch {
-      const url = await tab.playwright.url().catch(() => '');
+      const url = await adapter.url().catch(() => '');
       if (!/\/work\/app/.test(url) && navTries < 3) {
         navTries += 1;
-        await tab.goto(APP_URL);
+        await adapter.goto(APP_URL);
         continue;
       }
-      const login = await detectLogin(tab);
+      const login = await detectLogin(adapter);
       if (login) {
         return {
           ok: false,
           error: 'LOGIN_REQUIRED',
-          hint: 'Accio Work shows a login dialog ("' + login + '"). Ask the user to sign in manually in the real browser tab (Google or email), then re-run.',
+          hint: 'Accio Work shows a login dialog ("' + login + '"). Ask the user to sign in manually in the real browser tab (Google or email), then re-run. Never type or infer credentials yourself.',
         };
       }
       return { ok: false, error: 'COMPOSER_NOT_FOUND' };
@@ -311,23 +397,26 @@ export async function runSourcing(tab, opts = {}) {
 
   const composerText = async () => {
     try {
-      return (await composerOf(tab).innerText()).trim();
+      return (await composerOf(adapter).innerText()).trim();
     } catch {
       return null;
     }
   };
+  // Check most-reliable signals first to avoid false positives from a
+  // temporarily empty composer (e.g. during page hydration).
   const runStarted = async () => {
+    if ((await adapter.locator(FRAME_SEL).count().catch(() => 0)) > 0) return true;
+    if ((await adapter.getByRole('button', { name: 'Retry' }).count().catch(() => 0)) > 0) return true;
     const t = await composerText();
     if (t === '') return true;
-    if ((await tab.playwright.getByRole('button', { name: 'Retry' }).count().catch(() => 0)) > 0) return true;
-    return (await tab.playwright.locator(FRAME_SEL).count().catch(() => 0)) > 0;
+    return false;
   };
   // The send button has no accessible name and its DOM position shifts, so
   // find it geometrically: rightmost button in the composer footer band.
   const sendIndex = async () => {
-    const cb = await composerOf(tab).boundingBox().catch(() => null);
+    const cb = await composerOf(adapter).boundingBox().catch(() => null);
     if (!cb) return -1;
-    const btns = tab.playwright.locator('button');
+    const btns = adapter.locator('button');
     const n = await btns.count().catch(() => 0);
     let best = -1;
     let bestX = -1;
@@ -348,12 +437,20 @@ export async function runSourcing(tab, opts = {}) {
     return best;
   };
 
-  await pasteType(tab, sentQuery);
+  // Fill the composer. Check before pasting to avoid appending duplicate text
+  // when the first paste already succeeded.
   let filled = false;
   const fillDeadline = Date.now() + 40000;
   while (Date.now() < fillDeadline && !filled) {
-    await pasteType(tab, sentQuery);
-    await tab.playwright.waitForTimeout(1500);
+    const current = await composerText();
+    if (current === sentQuery.trim()) { filled = true; break; }
+    if (!current) {
+      // Composer is empty — safe to paste.
+      await pasteType(adapter, sentQuery);
+    }
+    // If composer has partial/wrong content, wait for the page to settle
+    // rather than pasting again (which would append).
+    await adapter.waitForTimeout(1500);
     filled = (await composerText()) === sentQuery.trim();
   }
   if (!filled) return { ok: false, error: 'COMPOSER_NOT_FOUND' };
@@ -367,17 +464,17 @@ export async function runSourcing(tab, opts = {}) {
     if (round % 2 === 0) {
       const idx = await sendIndex();
       if (idx >= 0) {
-        await tab.playwright
+        await adapter
           .locator('button')
           .nth(idx)
           .click({ force: true, timeout: 2000 })
           .catch(() => {});
       }
     } else {
-      await composerOf(tab).press('Enter').catch(() => {});
+      await composerOf(adapter).press('Enter').catch(() => {});
     }
     round += 1;
-    await tab.playwright.waitForTimeout(2000);
+    await adapter.waitForTimeout(2000);
     submitted = await runStarted();
   }
   if (!submitted) return { ok: false, error: 'SUBMIT_FAILED' };
@@ -387,11 +484,11 @@ export async function runSourcing(tab, opts = {}) {
   let stable = 0;
   let finalText = '';
   while (Date.now() < deadline) {
-    await tab.playwright.waitForTimeout(pollMs);
-    const frameCount = await tab.playwright.locator(FRAME_SEL).count().catch(() => 0);
+    await adapter.waitForTimeout(pollMs);
+    const frameCount = await adapter.locator(FRAME_SEL).count().catch(() => 0);
     if (frameCount === 0) continue;
     const txt = String(
-      (await tab.playwright
+      (await adapter
         .frameLocator(FRAME_SEL)
         .locator('body')
         .innerText()
@@ -408,23 +505,51 @@ export async function runSourcing(tab, opts = {}) {
       last = txt;
     }
   }
+
   if (!finalText) {
     if (jsonMode) {
-      const aj = await extractAgentJson(tab);
-      if (aj) return { ok: true, query, layout: 'agent-json', items: aj, source: 'agent-json', raw: '' };
+      const aj = await extractAgentJson(adapter);
+      if (aj) return applyConstraints({ ok: true, query, layout: 'agent-json', items: aj, source: 'agent-json', raw: '' });
     }
-    const fb = await transcriptFallback(tab, query);
-    if (fb.trim()) {
+    const fb = await transcriptFallback(adapter, query);
+    // Gate the AX fallback: only report ok:true when the text actually looks
+    // like sourcing results, not navigation chrome or an empty loading state.
+    if (fb.trim() && looksLikeSourcingResult(fb)) {
       const parsed = parseSourcingText(fb);
-      return { ok: true, query, ...parsed, raw: fb, source: 'ax-fallback' };
+      return applyConstraints({ ok: true, query, ...parsed, raw: fb, source: 'ax-fallback' });
     }
-    return { ok: false, error: 'TIMEOUT', raw: last };
+    return { ok: false, error: 'TIMEOUT', raw: last || fb };
   }
 
   const parsed = parseSourcingText(finalText);
   if (jsonMode) {
-    const aj = await extractAgentJson(tab);
-    if (aj) return { ok: true, query, layout: 'agent-json', items: aj, source: 'agent-json', raw: finalText };
+    const aj = await extractAgentJson(adapter);
+    if (aj) return applyConstraints({ ok: true, query, layout: 'agent-json', items: aj, source: 'agent-json', raw: finalText });
   }
-  return { ok: true, query, ...parsed, raw: finalText, source: 'content-slot' };
+  return applyConstraints({ ok: true, query, ...parsed, raw: finalText, source: 'content-slot' });
+}
+
+/**
+ * Backward-compatible entry point. Accepts a Qoder browser-use Tab object.
+ * Internally wraps it in the Qoder adapter and delegates to _runSourcingCore.
+ *
+ * @param {object} tab  Qoder browser-use tab (from browser.tabs.new())
+ * @param {object} opts { query, waitMs, pollMs, settleRounds, jsonMode, constraints }
+ * @returns {object} { ok, layout, items, excluded?, raw, source } or { ok:false, error }
+ */
+export async function runSourcing(tab, opts = {}) {
+  const { createQoderAdapter } = await import('./adapters/qoder.mjs');
+  return _runSourcingCore(createQoderAdapter(tab), opts);
+}
+
+/**
+ * Platform-agnostic entry point. Accepts any adapter implementing the
+ * interface documented in adapters/INTERFACE.md.
+ *
+ * @param {object} adapter  Browser adapter (see adapters/INTERFACE.md)
+ * @param {object} opts { query, waitMs, pollMs, settleRounds, jsonMode, constraints }
+ * @returns {object} { ok, layout, items, excluded?, raw, source } or { ok:false, error }
+ */
+export async function runSourcingWithAdapter(adapter, opts = {}) {
+  return _runSourcingCore(adapter, opts);
 }
