@@ -13,6 +13,32 @@ const APP_URL =
   'https://www.accio.com/work/app?src=f_seo-github-skill&defaultAgent=accio-com-buyer-assistant&language=en';
 const FRAME_SEL = 'iframe[src*="buyer-agent-chatui-message"]';
 
+/**
+ * Opt-in suffix that asks the Accio agent to mirror its result cards as a
+ * fenced JSON block. Best-effort: it makes runs slower (the agent adds tool
+ * steps) and is not guaranteed, so card parsing remains the default path.
+ */
+const JSON_SUFFIX =
+  '\n\nAfter the result cards, also output ONE fenced ```json code block: an array with one object per card shown, using exactly these field names where present: type, name, title, source, verified, years, region, country, metrics, main_categories, products, prices, min_order, supplier, supplier_rating, requirement_match. No prose inside the block.';
+
+/** Read the last fenced JSON array the agent rendered, if any. */
+async function extractAgentJson(tab) {
+  const blocks = tab.playwright.locator('pre, code');
+  const n = await blocks.count().catch(() => 0);
+  for (let i = n - 1; i >= 0; i--) {
+    const t = String((await blocks.nth(i).innerText().catch(() => '')) || '').trim();
+    if (t.startsWith('[') || t.startsWith('{')) {
+      try {
+        const v = JSON.parse(t);
+        if (Array.isArray(v) && v.length) return v;
+      } catch {
+        /* not json */
+      }
+    }
+  }
+  return null;
+}
+
 const PRICE_RE = /(CN¥|US\s?\$|€|£|\$)\s?[\d.,]+(\s?[-–]\s?[\d.,]+)?/;
 const MIN_ORDER_RE = /^(Min\. order|MOQ)\s*[:：]?\s*(.+)$/i;
 const YRS_RE = /^(\d+)\s*yrs?$/i;
@@ -252,23 +278,35 @@ async function detectLogin(tab) {
  * @returns {object} { ok, layout, items, raw, ... } or { ok:false, error }
  */
 export async function runSourcing(tab, opts = {}) {
-  const { query, waitMs = 180000, pollMs = 3000, settleRounds = 3 } = opts;
+  const { query, waitMs = 180000, pollMs = 3000, settleRounds = 3, jsonMode = false } = opts;
   if (!query) return { ok: false, error: 'MISSING_QUERY' };
+  const sentQuery = jsonMode ? query + JSON_SUFFIX : query;
 
   await tab.goto(APP_URL);
-  const composer = await composerOf(tab);
-  try {
-    await composer.waitFor({ state: 'visible', timeout: 20000 });
-  } catch {
-    const login = await detectLogin(tab);
-    if (login) {
-      return {
-        ok: false,
-        error: 'LOGIN_REQUIRED',
-        hint: 'Accio Work shows a login dialog ("' + login + '"). Ask the user to sign in manually in the real browser tab (Google or email), then re-run.',
-      };
+  // The app route can bounce to the /work marketing page on a cold profile;
+  // retry navigation until the composer (or a login dialog) appears.
+  let navTries = 0;
+  for (;;) {
+    try {
+      await composerOf(tab).waitFor({ state: 'visible', timeout: 20000 });
+      break;
+    } catch {
+      const url = await tab.playwright.url().catch(() => '');
+      if (!/\/work\/app/.test(url) && navTries < 3) {
+        navTries += 1;
+        await tab.goto(APP_URL);
+        continue;
+      }
+      const login = await detectLogin(tab);
+      if (login) {
+        return {
+          ok: false,
+          error: 'LOGIN_REQUIRED',
+          hint: 'Accio Work shows a login dialog ("' + login + '"). Ask the user to sign in manually in the real browser tab (Google or email), then re-run.',
+        };
+      }
+      return { ok: false, error: 'COMPOSER_NOT_FOUND' };
     }
-    return { ok: false, error: 'COMPOSER_NOT_FOUND' };
   }
 
   const composerText = async () => {
@@ -310,32 +348,33 @@ export async function runSourcing(tab, opts = {}) {
     return best;
   };
 
+  await pasteType(tab, sentQuery);
   let filled = false;
   const fillDeadline = Date.now() + 40000;
   while (Date.now() < fillDeadline && !filled) {
-    await pasteType(tab, query);
+    await pasteType(tab, sentQuery);
     await tab.playwright.waitForTimeout(1500);
-    filled = (await composerText()) === query.trim();
+    filled = (await composerText()) === sentQuery.trim();
   }
   if (!filled) return { ok: false, error: 'COMPOSER_NOT_FOUND' };
 
-  // Enter submits once the editor state holds text; fall back to clicking
-  // the geometric send button if a round does not start the run.
+  // Clicking the geometric send button is the reliable submit; Enter is the
+  // fallback (it is flaky on cold tabs).
   let submitted = false;
-  const submitDeadline = Date.now() + 30000;
+  const submitDeadline = Date.now() + 40000;
   let round = 0;
   while (Date.now() < submitDeadline && !submitted) {
     if (round % 2 === 0) {
-      await composerOf(tab).press('Enter').catch(() => {});
-    } else {
       const idx = await sendIndex();
       if (idx >= 0) {
         await tab.playwright
           .locator('button')
           .nth(idx)
-          .click({ force: true, timeout: 1500 })
+          .click({ force: true, timeout: 2000 })
           .catch(() => {});
       }
+    } else {
+      await composerOf(tab).press('Enter').catch(() => {});
     }
     round += 1;
     await tab.playwright.waitForTimeout(2000);
@@ -370,6 +409,10 @@ export async function runSourcing(tab, opts = {}) {
     }
   }
   if (!finalText) {
+    if (jsonMode) {
+      const aj = await extractAgentJson(tab);
+      if (aj) return { ok: true, query, layout: 'agent-json', items: aj, source: 'agent-json', raw: '' };
+    }
     const fb = await transcriptFallback(tab, query);
     if (fb.trim()) {
       const parsed = parseSourcingText(fb);
@@ -379,5 +422,9 @@ export async function runSourcing(tab, opts = {}) {
   }
 
   const parsed = parseSourcingText(finalText);
+  if (jsonMode) {
+    const aj = await extractAgentJson(tab);
+    if (aj) return { ok: true, query, layout: 'agent-json', items: aj, source: 'agent-json', raw: finalText };
+  }
   return { ok: true, query, ...parsed, raw: finalText, source: 'content-slot' };
 }

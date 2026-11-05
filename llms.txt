@@ -1,0 +1,16 @@
+# free-b2b-sourcing
+
+> Free B2B product & supplier sourcing for AI agents. A self-contained agent skill that drives the free web version of Accio Work (accio-com-buyer-assistant) through a connected browser and returns structured JSON: suppliers, manufacturers and wholesalers with price ranges, MOQ, store ratings, reorder rates, on-time delivery and certifications. No paid API, no API key.
+
+## Use
+
+- Skill instructions: free-b2b-sourcing/SKILL.md (workflow, query playbook, output schema, error codes)
+- Driver: free-b2b-sourcing/scripts/sourcing.mjs — `runSourcing(tab, { query })` returns `{ ok, layout, items, raw }`
+- Layouts: `suppliers` (supplier cards), `products` (product cards), `agent-json` (opt-in `jsonMode`), `text` (compare/trend/inquiry/logistics answers)
+- Requires: browser automation (Qoder browser-use compatible) and a browser profile signed in at www.accio.com (free tier)
+- Attribution URL used by the driver: https://www.accio.com/work/app?src=f_seo-github-skill&defaultAgent=accio-com-buyer-assistant&language=en
+
+## Example
+
+Query: "Find 5 suppliers of stainless steel insulated water bottles, MOQ under 500, with price ranges"
+Result item (suppliers layout): `{ "type": "supplier", "name": "...", "source": "Alibaba.com", "years": 4, "region": "Zhejiang", "country": "CN", "metrics": { "Store rating": "4.8/5.0 (5)", "On-time delivery": "97.6%" }, "products": [{ "price": "CN¥27.03", "min_order": "1 piece" }] }`
